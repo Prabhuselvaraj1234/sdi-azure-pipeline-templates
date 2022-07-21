@@ -1,0 +1,78 @@
+parameters:
+- name: deployToEnvironment
+  default: true
+
+jobs:
+  - job: MuleAppBuildDeploy
+    displayName: Mule App Build & Optional Deployment
+    condition: ne(variables['Build.SourceBranch'], 'refs/heads/master')
+
+    variables:
+      mavenLocalRepoCache: $(Pipeline.Workspace)/.m2/repository
+      mavenOptions: '-Xmx1024m -Dmaven.repo.local=$(mavenLocalRepoCache)'
+      codeRoot: $(Pipeline.Workspace)/code
+      configNonProdRoot: $(Pipeline.Workspace)/config-nonprod
+      automationRoot: $(Pipeline.Workspace)/automation
+      vAnypointWorkerType: $[ coalesce(variables['anypointWorkerType'], variables['anypointDefaultWorkerType']) ]
+      vAnypointWorkerCount: $[ coalesce(variables['anypointWorkerCount'], variables['anypointDefaultWorkerCount']) ]
+      vMuleConfigEnvironment: $[ lower(variables['anypointEnvironment']) ]
+
+    steps:    
+    - checkout: self
+      path: code
+    - checkout: git://SDI-API-MuleSoft/sdi-mule-config-nonprod@feature/icc-288-foundation
+      path: config-nonprod
+    - checkout: git://SDI-API-MuleSoft/sdi-azure-pipeline-templates@feature/icc-288-foundation
+      path: automation
+    
+    - task: Cache@2
+      displayName: Cache Maven Local Repo
+      inputs:
+        key: '"maven" | $(codeRoot)/pom.xml'
+        restoreKeys: maven
+        path: $(mavenLocalRepoCache)
+
+    - task: PythonScript@0
+      displayName: Prepare Artifact Metadata
+      inputs:
+        scriptSource: filePath
+        scriptPath: '$(automationRoot)/mule/scripts/mule-devops-module.py'
+        arguments: '--action prepare-artifact-metadata --source-root $(codeRoot) --build-number $(Build.BuildNumber)'
+      
+    - task: PythonScript@0
+      displayName: Prepare Final POM
+      inputs:
+        scriptSource: filePath
+        scriptPath: '$(automationRoot)/mule/scripts/mule-devops-module.py'
+        arguments: '--action prepare-final-pom --source-root $(codeRoot) --final-version $(release.preReleaseVersion)'
+
+    - task: MavenAuthenticate@0
+      displayName: Authenticate with Exchange
+      inputs:
+        mavenServiceConnections: 'anypoint-exchange-readonly'
+        
+    - task: Maven@3
+      displayName: Build & Unit Test
+      inputs:
+        mavenPomFile: '$(codeRoot)/final-pom.xml'
+        mavenOptions: '$(mavenOptions)'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        goals: 'package'
+        options: '-DskipMavenDeploy=true'
+        
+    - task: PythonScript@0
+      displayName: Prepare Deployment Properties
+      condition: and(succeeded(), eq('${{ parameters.deployToEnvironment }}', 'true'))
+      inputs:
+        scriptSource: filePath
+        scriptPath: '$(automationRoot)/mule/scripts/mule-devops-module.py'
+        arguments: '--action prepare-deployment-properties --source-root $(codeRoot) --config-root $(configNonProdRoot) --environment $(vMuleConfigEnvironment) --artifact-id $(release.artifactId) --final-version $(release.preReleaseVersion)'       
+
+    - task: Maven@3
+      displayName: Deploy to Environment
+      condition: and(succeeded(), eq('${{ parameters.deployToEnvironment }}', 'true'))
+      inputs:
+        mavenPomFile: '$(codeRoot)/final-pom.xml'
+        mavenOptions: '$(mavenOptions)'
+        goals: 'mule:deploy -P cloudhub -DmuleDeploy "-Dmule.artifact=$(codeRoot)/target/$(vMuleConfigEnvironment)-$(release.artifactId)-$(release.preReleaseVersion)-mule-application.jar" "-DanypointBusinessGroupId=$(anypointBusinessGroupId)" "-DanypointEnvironment=$(anypointEnvironment)" "-DmuleConfigEnvironment=$(vMuleConfigEnvironment)" "-Drelease.artifactId=$(release.artifactId)" "-Drelease.majorVersion=$(release.majorVersion)" "-DanypointWorkerType=$(vAnypointWorkerType)" "-DanypointWorkerCount=$(vAnypointWorkerCount)" "-DanypointConnectedAppClientId=$(anypointConnectedAppClientId)" "-DanypointConnectedAppClientSecret=$(anypointConnectedAppClientSecret)" "-DanypointPlatformClientId=$(anypointPlatformClientId)" "-DanypointPlatformClientSecret=$(anypointPlatformClientSecret)" "-DanypointSecurePropertyKey=$(anypointSecurePropertyKey)"'
